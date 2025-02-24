@@ -77,11 +77,11 @@ impl Contract {
         if self.abi_version < AbiVersion::V2_4 {
             self.update_init_data_internal(pubkey, tokens, data)
         } else {
-            self.pack_init_fields_to_cell(tokens)
+            self.pack_init_fields_into_cell(tokens)
         }
     }
 
-    fn pack_init_fields_to_cell(&self, tokens: &[NamedAbiValue]) -> Result<Cell> {
+    fn pack_init_fields_into_cell(&self, tokens: &[NamedAbiValue]) -> Result<Cell> {
         let ContractInitData::PlainFields(init_data) = &self.init_data else {
             anyhow::bail!("Dict init_data is not supported for ABI version >= 2.4")
         };
@@ -111,7 +111,7 @@ impl Contract {
                 init_values.push(i.ty.make_default_value())
             }
         }
-        let cell = AbiValue::tuple_to_builder(init_values.as_ref(), self.abi_version)?.build()?;
+        let cell = AbiValue::tuple_to_cell(init_values.as_ref(), self.abi_version)?;
         Ok(cell)
     }
 
@@ -172,6 +172,18 @@ impl Contract {
     /// NOTE: `tokens` can be a subset of init data fields, all other
     /// will be set to default.
     pub fn encode_init_data(
+        &self,
+        pubkey: &ed25519_dalek::VerifyingKey,
+        tokens: &[NamedAbiValue]
+    ) -> Result<Cell> {
+        if self.abi_version < AbiVersion::V2_4 {
+            self.encode_init_data_internal(pubkey, tokens)
+        } else {
+            self.pack_init_fields_into_cell(tokens)
+        }
+    }
+
+    fn encode_init_data_internal(
         &self,
         pubkey: &ed25519_dalek::VerifyingKey,
         tokens: &[NamedAbiValue],
@@ -237,10 +249,18 @@ impl Contract {
 
     /// Tries to parse init data fields of this contract from an account data.
     pub fn decode_init_data(&self, data: &DynCell) -> Result<Vec<NamedAbiValue>> {
+        if self.abi_version < AbiVersion::V2_4 {
+            self.decode_init_data_internal(data)
+        } else {
+            self.decode_init_fields(data)
+        }
+    }
+
+    fn decode_init_data_internal(&self, data: &DynCell) -> Result<Vec<NamedAbiValue>> {
         let init_data = data.parse::<Dict<u64, CellSlice>>()?;
 
         let ContractInitData::Dict(init_data_map) = &self.init_data else {
-            anyhow::bail!("")
+            anyhow::bail!("Plain init fields are not supported")
         };
         let mut result = Vec::with_capacity(init_data_map.len());
 
@@ -252,6 +272,24 @@ impl Contract {
         }
 
         Ok(result)
+    }
+
+    fn decode_init_fields(&self, data: &DynCell) -> Result<Vec<NamedAbiValue>> {
+        let ContractInitData::PlainFields(init_fields) = &self.init_data else {
+            anyhow::bail!("Plain init fields are not supported")
+        };
+
+        let values = self.decode_fields(data.as_slice()?)?;
+
+        let mut init_values = Vec::with_capacity(init_fields.len());
+
+        for i in values {
+            if init_fields.contains(i.name.as_ref()) {
+                init_values.push(i)
+            }
+        }
+
+        Ok(init_values)
     }
 
     /// Encodes an account data with the specified storage fields of this contract.

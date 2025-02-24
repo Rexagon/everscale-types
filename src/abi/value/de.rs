@@ -194,7 +194,10 @@ impl AbiValue {
                 Ok(Self::Bool(slice.load_bit()?))
             }
             AbiType::Cell => load_cell(version, last, slice).map(Self::Cell),
-            AbiType::Address => Ok(Self::Address(AnyAddr::load_from(slice).map(Box::new)?)),
+            AbiType::Address => {
+                ok!(preload_bits(1, slice));
+                Ok(Self::Address(AnyAddr::load_from(slice).map(Box::new)?))
+            },
             AbiType::Bytes => load_bytes(version, last, slice).map(Self::Bytes),
             AbiType::FixedBytes(len) => {
                 load_fixed_bytes(*len, version, last, slice).map(Self::FixedBytes)
