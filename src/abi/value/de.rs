@@ -197,7 +197,7 @@ impl AbiValue {
             AbiType::Address => {
                 ok!(preload_bits(1, slice));
                 Ok(Self::Address(AnyAddr::load_from(slice).map(Box::new)?))
-            },
+            }
             AbiType::Bytes => load_bytes(version, last, slice).map(Self::Bytes),
             AbiType::FixedBytes(len) => {
                 load_fixed_bytes(*len, version, last, slice).map(Self::FixedBytes)

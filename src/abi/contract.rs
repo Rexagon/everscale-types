@@ -174,7 +174,7 @@ impl Contract {
     pub fn encode_init_data(
         &self,
         pubkey: &ed25519_dalek::VerifyingKey,
-        tokens: &[NamedAbiValue]
+        tokens: &[NamedAbiValue],
     ) -> Result<Cell> {
         if self.abi_version < AbiVersion::V2_4 {
             self.encode_init_data_internal(pubkey, tokens)

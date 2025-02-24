@@ -1,9 +1,9 @@
-use std::sync::Arc;
 use bytes::Bytes;
 use num_bigint::BigInt;
+use std::sync::Arc;
 
-use crate::abi::*;
 use crate::abi::contract::ContractInitData;
+use crate::abi::*;
 use crate::models::StdAddr;
 use crate::prelude::{Cell, CellBuilder, CellFamily, HashBytes, RawDict, Store};
 
@@ -44,25 +44,28 @@ fn decode_json_abi_v24() {
     let key = ed25519_dalek::SigningKey::from([0u8; 32]);
     let pubkey = ed25519_dalek::VerifyingKey::from(&key);
 
-    if let Err(e) = contract.encode_init_data(&pubkey, &[NamedAbiValue {
-        name: Arc::from("a"),
-        value: AbiValue::Int(128, BigInt::from(0)),
-    }]) {
+    if let Err(e) = contract.encode_init_data(
+        &pubkey,
+        &[NamedAbiValue {
+            name: Arc::from("a"),
+            value: AbiValue::Int(128, BigInt::from(0)),
+        }],
+    ) {
         println!("Expected to fail because of unexpected field name. Err: {e:?}");
     }
-
 
     let init_values = vec![NamedAbiValue {
         name: Arc::from("b"),
         value: AbiValue::Int(128, BigInt::from(0)),
     }];
 
-    let cell = contract.encode_init_data(&pubkey, init_values.as_ref()).unwrap();
+    let cell = contract
+        .encode_init_data(&pubkey, init_values.as_ref())
+        .unwrap();
 
     let fields = contract.decode_init_data(cell.as_ref()).unwrap();
 
     assert_eq!(init_values, fields);
-
 
     let function = contract.find_function_by_id(0x01234567, true).unwrap();
     assert_eq!(function.input_id, 0x01234567);
