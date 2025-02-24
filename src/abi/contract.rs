@@ -17,9 +17,7 @@ use crate::num::Tokens;
 use crate::prelude::Dict;
 use ahash::HashMap;
 use anyhow::Result;
-use everscale_types::abi::error::ParseNamedAbiTypeError;
-use serde::__private::de::IdentifierDeserializer;
-use serde::{Deserialize, Deserializer};
+use serde::Deserialize;
 use sha2::Digest;
 
 use super::error::AbiError;
@@ -42,10 +40,15 @@ pub struct Contract {
     pub events: HashMap<Arc<str>, Event>,
 
     /// Contract init data.
-    pub init_data: HashMap<Arc<str>, (u64, NamedAbiType)>,
+    pub init_data: ContractInitData,
 
     /// Contract storage fields.
     pub fields: Arc<[NamedAbiType]>,
+}
+
+pub enum ContractInitData {
+    Dict(HashMap<Arc<str>, (u64, NamedAbiType)>),
+    PlainFields(HashSet<Arc<str>>),
 }
 
 impl Contract {
@@ -71,6 +74,53 @@ impl Contract {
         tokens: &[NamedAbiValue],
         data: &Cell,
     ) -> Result<Cell> {
+        if self.abi_version < AbiVersion::V2_4 {
+            self.update_init_data_internal(pubkey, tokens, data)
+        } else {
+            self.pack_init_fields_to_cell(tokens)
+        }
+    }
+
+    fn pack_init_fields_to_cell(&self, tokens: &[NamedAbiValue]) -> Result<Cell> {
+        let ContractInitData::PlainFields(init_data) = &self.init_data else {
+            anyhow::bail!("Dict init_data is not supported for ABI version >= 2.4")
+        };
+
+        let mut init_values = Vec::with_capacity(self.fields.len());
+
+        let mut tokens_map = HashMap::<Arc<str>, AbiValue>::with_capacity_and_hasher(
+            tokens.len(),
+            Default::default(),
+        );
+
+        for i in tokens {
+            let i = i.clone();
+            tokens_map.insert(i.name, i.value);
+        }
+
+        for i in self.fields.as_ref() {
+            let token = tokens_map.remove_entry(i.name.as_ref());
+
+            if init_data.get(i.name.as_ref()).is_some() {
+                let (_, value) = token.ok_or(AbiError::UnexpectedInitDataParam(i.name.clone()))?;
+                init_values.push(value)
+            } else {
+                if let Some((name, _)) = token {
+                    return Err(AbiError::UnexpectedInitDataParam(name).into());
+                }
+                init_values.push(i.ty.make_default_value())
+            }
+        }
+        let cell = AbiValue::tuple_to_builder(init_values.as_ref(), self.abi_version)?.build()?;
+        Ok(cell)
+    }
+
+    fn update_init_data_internal(
+        &self,
+        pubkey: Option<&ed25519_dalek::VerifyingKey>,
+        tokens: &[NamedAbiValue],
+        data: &Cell,
+    ) -> Result<Cell> {
         // Always check if data is valid
         let mut result = data.parse::<RawDict<64>>()?;
 
@@ -79,11 +129,15 @@ impl Contract {
             return Ok(data.clone());
         }
 
+        let ContractInitData::Dict(init_data) = &self.init_data else {
+            anyhow::bail!("Plain init_data is not supported for ABI version < 2.4")
+        };
+
         let context = Cell::empty_context();
         let mut key_builder = CellBuilder::new();
 
         for token in tokens {
-            let Some((key, ty)) = self.init_data.get(token.name.as_ref()) else {
+            let Some((key, ty)) = init_data.get(token.name.as_ref()) else {
                 anyhow::bail!(AbiError::UnexpectedInitDataParam(token.name.clone()));
             };
             token.check_type(ty)?;
@@ -124,8 +178,11 @@ impl Contract {
     ) -> Result<Cell> {
         let mut result = RawDict::<64>::new();
 
-        let mut init_data = self
-            .init_data
+        let ContractInitData::Dict(init_data) = &self.init_data else {
+            anyhow::bail!("Plain init fields are not supported")
+        };
+
+        let mut init_data = init_data
             .iter()
             .map(|(name, value)| (name.as_ref(), value))
             .collect::<HashMap<_, _>>();
@@ -182,9 +239,12 @@ impl Contract {
     pub fn decode_init_data(&self, data: &DynCell) -> Result<Vec<NamedAbiValue>> {
         let init_data = data.parse::<Dict<u64, CellSlice>>()?;
 
-        let mut result = Vec::with_capacity(self.init_data.len());
+        let ContractInitData::Dict(init_data_map) = &self.init_data else {
+            anyhow::bail!("")
+        };
+        let mut result = Vec::with_capacity(init_data_map.len());
 
-        for (key, item) in self.init_data.values() {
+        for (key, item) in init_data_map.values() {
             let Some(mut value) = init_data.get(key)? else {
                 anyhow::bail!(AbiError::InitDataFieldNotFound(item.name.clone()));
             };
@@ -251,87 +311,12 @@ impl<'de> Deserialize<'de> for Contract {
             }
         }
 
+        #[derive(Deserialize)]
         struct SerdeNamedAbiType {
+            #[serde(flatten)]
             named_abi_type: NamedAbiType,
             #[serde(default)]
             init: bool,
-        }
-
-        impl<'de> Deserialize<'de> for SerdeNamedAbiType {
-            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-            where
-                D: serde::Deserializer<'de>,
-            {
-                use serde::de::Error;
-
-                #[derive(Deserialize)]
-                struct Helper<'a> {
-                    name: String,
-                    #[serde(rename = "type", borrow)]
-                    ty: Cow<'a, str>,
-                    #[serde(default)]
-                    init: bool,
-                    #[serde(default)]
-                    components: Option<Vec<Helper<'a>>>,
-                }
-
-                impl From<SerdeNamedAbiType> for NamedAbiType {
-                    fn from(value: SerdeNamedAbiType) -> Self {
-                        Self {
-                            name: value.named_abi_type.name,
-                            ty: value.named_abi_type.ty,
-                        }
-                    }
-                }
-
-                impl TryFrom<Helper<'_>> for SerdeNamedAbiType {
-                    type Error = ParseNamedAbiTypeError;
-
-                    fn try_from(value: Helper<'_>) -> Result<Self, Self::Error> {
-                        let mut ty = match AbiType::from_simple_str(&value.ty) {
-                            Ok(ty) => ty,
-                            Err(error) => {
-                                return Err(ParseNamedAbiTypeError::InvalidType {
-                                    ty: value.ty.into(),
-                                    error,
-                                });
-                            }
-                        };
-
-                        match (ty.components_mut(), value.components) {
-                            (Some(ty), Some(components)) => {
-                                *ty = ok!(components
-                                    .into_iter()
-                                    .map(Self::try_from)
-                                    .map(NamedAbiType::from)
-                                    .collect::<Result<Arc<[_]>, _>>());
-                            }
-                            (Some(_), None) => {
-                                return Err(ParseNamedAbiTypeError::ExpectedComponents {
-                                    ty: value.ty.into(),
-                                })
-                            }
-                            (None, Some(_)) => {
-                                return Err(ParseNamedAbiTypeError::UnexpectedComponents {
-                                    ty: value.ty.into(),
-                                });
-                            }
-                            (None, None) => {}
-                        }
-
-                        Ok(Self {
-                            named_abi_type: NamedAbiType {
-                                name: value.name.into(),
-                                ty,
-                            },
-                            init: value.init,
-                        })
-                    }
-                }
-
-                let helper = ok!(<Helper as Deserialize>::deserialize(deserializer));
-                helper.try_into().map_err(Error::custom)
-            }
         }
 
         #[derive(Deserialize)]
@@ -447,25 +432,24 @@ impl<'de> Deserialize<'de> for Contract {
             .collect();
 
         let init_data = if abi_version >= AbiVersion::V2_4 {
-            contract
+            let init_fields = contract
                 .fields
-                .clone()
-                .into_iter()
+                .iter()
                 .filter(|x| x.init)
-                .map(|item| {
-                    let name = item.named_abi_type.name.clone();
-                    (name, (item.key, item.named_abi_type.ty))
-                })
-                .collect()
+                .map(|x| x.named_abi_type.name.clone())
+                .collect();
+            ContractInitData::PlainFields(init_fields)
         } else {
-            contract
+            let data = contract
                 .data
                 .into_iter()
                 .map(|item| {
                     let name = item.ty.name.clone();
                     (name, (item.key, item.ty))
                 })
-                .collect()
+                .collect();
+
+            ContractInitData::Dict(data)
         };
 
         Ok(Self {
@@ -479,7 +463,7 @@ impl<'de> Deserialize<'de> for Contract {
                     .fields
                     .into_iter()
                     .map(|x| x.named_abi_type)
-                    .collect(),
+                    .collect::<Vec<_>>(),
             ),
         })
     }
